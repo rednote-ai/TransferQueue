@@ -1315,13 +1315,8 @@ class TransferQueueController:
 
                 if len(ready_for_consume_indexes) < batch_size:
                     if self.polling_mode:
-                        sampling_config = sampling_config or {}
-                        states = self.sampler._states.get(partition_id, {}).get(task_name, {})
-                        dp_rank = sampling_config.get("dp_rank", None)
-                        batch_index = sampling_config.get("batch_index", None)
-
                         # Return cached result if available
-                        if dp_rank is not None and dp_rank in states and batch_index in states[dp_rank]:
+                        if self.sampler.has_cached_result(partition_id, task_name, sampling_config):
                             break
                         else:
                             logger.debug(
