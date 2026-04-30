@@ -52,6 +52,8 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
 
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
+TQ_CONTROLLER_REQUEST_TIMEOUT = float(os.environ.get("TQ_CONTROLLER_REQUEST_TIMEOUT", 30))
+TQ_CONTROLLER_SOCKET_POOL_SIZE = max(1, int(os.environ.get("TQ_CONTROLLER_SOCKET_POOL_SIZE", 10)))
 
 
 class AsyncTransferQueueClient:
@@ -78,6 +80,10 @@ class AsyncTransferQueueClient:
             raise TypeError(f"controller_info must be ZMQServerInfo, got {type(controller_info)}")
         self.client_id = client_id
         self._controller: ZMQServerInfo = controller_info
+        self._controller_context = zmq.asyncio.Context()
+        self._controller_socket_pools: dict[str, list[zmq.asyncio.Socket]] = {}
+        self._controller_socket_locks: dict[str, list[asyncio.Lock]] = {}
+        self._controller_socket_next_index: dict[str, int] = {}
         logger.info(f"[{self.client_id}]: Registered Controller server {controller_info.id} at {controller_info.ip}")
 
     def initialize_storage_manager(
@@ -98,6 +104,55 @@ class AsyncTransferQueueClient:
         self.storage_manager = TransferQueueStorageManagerFactory.create(
             manager_type, controller_info=self._controller, config=config
         )
+
+    def _create_controller_socket(self, socket_name: str, index: int, address: str) -> zmq.asyncio.Socket:
+        server_info = self._controller
+        identity = f"{self.client_id}_to_{server_info.id}_{socket_name}_{index}_{uuid4().hex[:8]}".encode()
+        socket = create_zmq_socket(self._controller_context, zmq.DEALER, identity=identity, ip=server_info.ip)
+        socket.connect(address)
+        logger.debug(
+            f"[{self.client_id}]: Connected cached Controller socket {socket_name}[{index}] to "
+            f"{server_info.id} at {address} with identity {identity.decode()}"
+        )
+        return socket
+
+    def _get_controller_socket(self, socket_name: str) -> tuple[str, zmq.asyncio.Socket, asyncio.Lock, int]:
+        server_info = self._controller
+        if not server_info:
+            raise RuntimeError("No controller registered")
+
+        address = format_zmq_address(server_info.ip, server_info.ports.get(socket_name))
+        pool = self._controller_socket_pools.get(socket_name)
+        locks = self._controller_socket_locks.get(socket_name)
+        if pool is None or locks is None:
+            pool = [
+                self._create_controller_socket(socket_name, index, address)
+                for index in range(TQ_CONTROLLER_SOCKET_POOL_SIZE)
+            ]
+            locks = [asyncio.Lock() for _ in range(TQ_CONTROLLER_SOCKET_POOL_SIZE)]
+            self._controller_socket_pools[socket_name] = pool
+            self._controller_socket_locks[socket_name] = locks
+            self._controller_socket_next_index[socket_name] = 0
+
+        index = self._controller_socket_next_index.get(socket_name, 0) % len(pool)
+        self._controller_socket_next_index[socket_name] = (index + 1) % len(pool)
+
+        socket = pool[index]
+        if socket.closed:
+            socket = self._create_controller_socket(socket_name, index, address)
+            pool[index] = socket
+
+        return address, socket, locks[index], index
+
+    def _drop_controller_socket(self, socket_name: str, index: int) -> None:
+        pool = self._controller_socket_pools.get(socket_name)
+        if pool is None or index >= len(pool):
+            return
+        socket = pool[index]
+        if socket is not None and not socket.closed:
+            socket.close(linger=0)
+        # Leave a closed socket placeholder so the next request recreates only
+        # this pool slot while preserving round-robin order and locks.
 
     # TODO (TQStorage): Provide a general dynamic socket function for both Client & Storage @huazhong.
     @staticmethod
@@ -120,35 +175,25 @@ class AsyncTransferQueueClient:
         def decorator(func: Callable):
             @wraps(func)
             async def wrapper(self, *args, **kwargs):
-                server_info = self._controller
-                if not server_info:
-                    raise RuntimeError("No controller registered")
-
-                context = zmq.asyncio.Context()
-                address = format_zmq_address(server_info.ip, server_info.ports.get(socket_name))
-                identity = f"{self.client_id}_to_{server_info.id}_{uuid4().hex[:8]}".encode()
-                sock = create_zmq_socket(context, zmq.DEALER, identity=identity, ip=server_info.ip)
-
-                try:
-                    sock.connect(address)
-                    logger.debug(
-                        f"[{self.client_id}]: Connected to Controller {server_info.id} at {address} "
-                        f"with identity {identity.decode()}"
-                    )
-
-                    kwargs["socket"] = sock
-                    return await func(self, *args, **kwargs)
-                except Exception as e:
-                    logger.error(f"[{self.client_id}]: Error in socket operation with Controller {server_info.id}: {e}")
-                    raise
-                finally:
+                last_error = None
+                for attempt in range(2):
+                    address, sock, lock, socket_index = self._get_controller_socket(socket_name)
                     try:
-                        if not sock.closed:
-                            sock.close(linger=-1)
+                        async with lock:
+                            kwargs["socket"] = sock
+                            return await asyncio.wait_for(
+                                func(self, *args, **kwargs),
+                                timeout=TQ_CONTROLLER_REQUEST_TIMEOUT,
+                            )
                     except Exception as e:
-                        logger.warning(f"[{self.client_id}]: Error closing socket to Controller {server_info.id}: {e}")
-
-                    context.term()
+                        last_error = e
+                        logger.warning(
+                            f"[{self.client_id}]: Controller request via {socket_name} at {address} failed "
+                            f"(attempt {attempt + 1}/2): {e}"
+                        )
+                        self._drop_controller_socket(socket_name, socket_index)
+                assert last_error is not None
+                raise last_error
 
             return wrapper
 
@@ -1110,6 +1155,12 @@ class AsyncTransferQueueClient:
     def close(self) -> None:
         """Close the client and cleanup resources including storage manager."""
         try:
+            for pool in getattr(self, "_controller_socket_pools", {}).values():
+                for socket in pool:
+                    if socket is not None and not socket.closed:
+                        socket.close(linger=0)
+            if hasattr(self, "_controller_context") and self._controller_context is not None:
+                self._controller_context.term()
             if hasattr(self, "storage_manager") and self.storage_manager:
                 if hasattr(self.storage_manager, "close"):
                     self.storage_manager.close()
